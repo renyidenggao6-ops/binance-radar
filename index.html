@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Binance 实时行情雷达</title>
+
+<style>
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0b0e11;
+    color: #eaecef;
+    font-family: Arial, sans-serif;
+}
+
+.header {
+    padding: 18px;
+    background: #181a20;
+    border-bottom: 1px solid #2b2f36;
+}
+
+.title {
+    font-size: 22px;
+    font-weight: bold;
+}
+
+.status {
+    margin-top: 6px;
+    font-size: 13px;
+    color: #0ecb81;
+}
+
+.container {
+    padding: 15px;
+}
+
+.card {
+    background: #181a20;
+    border: 1px solid #2b2f36;
+    border-radius: 12px;
+    margin-bottom: 12px;
+    overflow: hidden;
+}
+
+.card-title {
+    padding: 14px;
+    font-size: 17px;
+    font-weight: bold;
+    border-bottom: 1px solid #2b2f36;
+}
+
+.row {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr;
+    padding: 13px;
+    border-bottom: 1px solid #2b2f36;
+    font-size: 14px;
+}
+
+.row:last-child {
+    border-bottom: none;
+}
+
+.green {
+    color: #0ecb81;
+}
+
+.red {
+    color: #f6465d;
+}
+
+.radar {
+    padding: 15px;
+}
+
+.radar-item {
+    padding: 13px;
+    margin-bottom: 8px;
+    background: #20242b;
+    border-radius: 8px;
+}
+
+.big {
+    font-size: 20px;
+    font-weight: bold;
+}
+</style>
+</head>
+
+<body>
+
+<div class="header">
+    <div class="title">🚀 Binance 实时行情雷达</div>
+    <div class="status">● 雷达系统运行中</div>
+</div>
+
+<div class="container">
+
+<div class="card">
+    <div class="card-title">📊 市场行情</div>
+
+    <div class="row">
+        <b>币种</b>
+        <b>价格</b>
+        <b>24h</b>
+        <b>成交量</b>
+    </div>
+
+    <div class="row">
+        <b>BTCUSDT</b>
+        <span id="btc">读取中...</span>
+        <span id="btcChange">--</span>
+        <span>--</span>
+    </div>
+
+    <div class="row">
+        <b>ETHUSDT</b>
+        <span id="eth">读取中...</span>
+        <span id="ethChange">--</span>
+        <span>--</span>
+    </div>
+
+    <div class="row">
+        <b>SOLUSDT</b>
+        <span id="sol">读取中...</span>
+        <span id="solChange">--</span>
+        <span>--</span>
+    </div>
+
+</div>
+
+<div class="card">
+    <div class="card-title">🚨 异动雷达</div>
+
+    <div class="radar">
+
+        <div class="radar-item">
+            <div>市场状态</div>
+            <div class="big green">实时连接中</div>
+        </div>
+
+        <div class="radar-item">
+            <div>BTC</div>
+            <div id="btcRadar">等待数据...</div>
+        </div>
+
+        <div class="radar-item">
+            <div>ETH</div>
+            <div id="ethRadar">等待数据...</div>
+        </div>
+
+    </div>
+</div>
+
+</div>
+
+<script>
+
+async function getPrice(symbol, priceId, changeId, radarId) {
+
+    try {
+
+        const response = await fetch(
+            "https://api.binance.com/api/v3/ticker/24hr?symbol=" + symbol
+        );
+
+        const data = await response.json();
+
+        const price = Number(data.lastPrice);
+        const change = Number(data.priceChangePercent);
+
+        document.getElementById(priceId).innerText =
+            price.toLocaleString();
+
+        const changeElement =
+            document.getElementById(changeId);
+
+        changeElement.innerText =
+            change.toFixed(2) + "%";
+
+        if (change >= 0) {
+            changeElement.className = "green";
+        } else {
+            changeElement.className = "red";
+        }
+
+        document.getElementById(radarId).innerText =
+            change >= 3
+            ? "🔥 强势上涨 " + change.toFixed(2) + "%"
+            : change <= -3
+            ? "⚠️ 快速下跌 " + change.toFixed(2) + "%"
+            : "正常波动 " + change.toFixed(2) + "%";
+
+    } catch (error) {
+
+        document.getElementById(priceId).innerText =
+            "连接失败";
+
+    }
+}
+
+function update() {
+
+    getPrice(
+        "BTCUSDT",
+        "btc",
+        "btcChange",
+        "btcRadar"
+    );
+
+    getPrice(
+        "ETHUSDT",
+        "eth",
+        "ethChange",
+        "ethRadar"
+    );
+
+    getPrice(
+        "SOLUSDT",
+        "sol",
+        "solChange",
+        "solRadar"
+    );
+}
+
+update();
+
+setInterval(update, 5000);
+
+</script>
+
+</body>
+</html>
