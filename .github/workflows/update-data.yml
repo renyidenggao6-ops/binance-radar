@@ -1,0 +1,207 @@
+name: Update Binance Market Data
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+
+      - name: Update Binance data
+        run: |
+          python3 - <<'PY'
+          import json
+          import time
+          import urllib.request
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime, timezone
+
+          BASE = "https://fapi.binance.com"
+
+          def get_json(url):
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          headers={"User-Agent": "binance-radar/1.0"}
+                      )
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          return json.loads(r.read().decode())
+                  except Exception:
+                      if attempt == 2:
+                          return None
+                      time.sleep(1)
+
+          exchange = get_json(BASE + "/fapi/v1/exchangeInfo")
+          tickers = get_json(BASE + "/fapi/v1/ticker/24hr")
+
+          if not exchange or not tickers:
+              raise SystemExit("Binance API unavailable")
+
+          symbols = {
+              s["symbol"]
+              for s in exchange["symbols"]
+              if s.get("status") == "TRADING"
+              and s.get("quoteAsset") == "USDT"
+              and s.get("contractType") == "PERPETUAL"
+          }
+
+          ticker_map = {
+              x["symbol"]: x
+              for x in tickers
+              if x["symbol"] in symbols
+          }
+
+          selected = sorted(
+              ticker_map.keys(),
+              key=lambda x: float(ticker_map[x].get("quoteVolume", 0)),
+              reverse=True
+          )
+
+          def get_symbol_data(symbol):
+              result = {
+                  "symbol": symbol,
+                  "price": None,
+                  "change24h": None,
+                  "quoteVolume24h": None,
+                  "15m": None,
+                  "1h": None
+              }
+
+              t = ticker_map.get(symbol)
+
+              if t:
+                  result["price"] = float(t["lastPrice"])
+                  result["change24h"] = float(t["priceChangePercent"])
+                  result["quoteVolume24h"] = float(t["quoteVolume"])
+
+              for interval in ["15m", "1h"]:
+                  url = (
+                      BASE +
+                      "/fapi/v1/klines?symbol=" +
+                      symbol +
+                      "&interval=" +
+                      interval +
+                      "&limit=12"
+                  )
+
+                  k = get_json(url)
+
+                  if not k:
+                      continue
+
+                  candles = []
+
+                  for row in k:
+                      candles.append({
+                          "time": datetime.fromtimestamp(
+                              row[0] / 1000,
+                              timezone.utc
+                          ).isoformat(),
+                          "open": float(row[1]),
+                          "high": float(row[2]),
+                          "low": float(row[3]),
+                          "close": float(row[4]),
+                          "volume": float(row[5])
+                      })
+
+                  if candles:
+                      latest = candles[-1]
+
+                      first_close = candles[0]["open"]
+                      last_close = latest["close"]
+
+                      change_pct = (
+                          (last_close - first_close) /
+                          first_close * 100
+                          if first_close else 0
+                      )
+
+                      window_high = max(x["high"] for x in candles)
+                      window_low = min(x["low"] for x in candles)
+
+                      range_pct = (
+                          (window_high - window_low) /
+                          window_low * 100
+                          if window_low else 0
+                      )
+
+                      result[interval] = {
+                          "open": latest["open"],
+                          "high": latest["high"],
+                          "low": latest["low"],
+                          "close": latest["close"],
+                          "volume": latest["volume"],
+                          "changePct": change_pct,
+                          "windowHigh": window_high,
+                          "windowLow": window_low,
+                          "rangePct": range_pct,
+                          "candles": candles
+                      }
+
+              return result
+
+          results = []
+
+          with ThreadPoolExecutor(max_workers=12) as executor:
+              jobs = {
+                  executor.submit(get_symbol_data, symbol): symbol
+                  for symbol in selected
+              }
+
+              for job in as_completed(jobs):
+                  try:
+                      item = job.result()
+                      results.append(item)
+                  except Exception as e:
+                      print("Error:", jobs[job], e)
+
+          results.sort(
+              key=lambda x: x.get("quoteVolume24h") or 0,
+              reverse=True
+          )
+
+          data = {
+              "generatedAt": datetime.now(timezone.utc).isoformat(),
+              "source": "Binance USD-M Futures public market data",
+              "count": len(results),
+              "description": {
+                  "price": "当前价格",
+                  "change24h": "24小时涨跌幅%",
+                  "quoteVolume24h": "24小时成交额",
+                  "15m": "15分钟K线数据",
+                  "1h": "1小时K线数据",
+                  "windowHigh": "最近12根K线最高价",
+                  "windowLow": "最近12根K线最低价",
+                  "rangePct": "最近12根K线振幅%"
+              },
+              "symbols": results
+          }
+
+          with open("data.json", "w", encoding="utf-8") as f:
+              json.dump(
+                  data,
+                  f,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              )
+
+          print("Updated:", len(results), "symbols")
+          PY
+
+      - name: Save data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git diff --cached --quiet || git commit -m "Update Binance market data"
+          git push
