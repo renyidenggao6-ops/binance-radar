@@ -4,404 +4,1595 @@ const app = express();
 app.set("json spaces", 2);
 
 const PORT = Number(process.env.PORT || 3000);
-const MARKET = (process.env.MARKET || "futures").toLowerCase();
-const BASE = process.env.BINANCE_BASE_URL || (MARKET === "spot" ? "https://api.binance.com" : "https://fapi.binance.com");
-const PREFIX = MARKET === "spot" ? "/api/v3" : "/fapi/v1";
-const CACHE_MS = Number(process.env.CACHE_MS || 2500);
-const PRICE_SAMPLE_MS = Number(process.env.PRICE_SAMPLE_MS || 1000);
-const SCAN_TOP = Math.min(Number(process.env.SCAN_TOP || 80), 150);
-const SCAN_CONCURRENCY = Math.min(Number(process.env.SCAN_CONCURRENCY || 8), 16);
+
+/*
+  IMPORTANT
+
+  This version uses Binance Spot public market data.
+
+  The previous deployment used Binance Futures:
+  https://fapi.binance.com
+
+  Railway may receive HTTP 451 from that endpoint depending on
+  the Railway server location.
+
+  We use multiple Binance public spot endpoints as fallbacks.
+*/
+
+const BINANCE_BASES = [
+  "https://data-api.binance.vision",
+  "https://api.binance.com",
+  "https://api1.binance.com",
+  "https://api2.binance.com",
+  "https://api3.binance.com"
+];
+
+const PREFIX = "/api/v3";
+
+const CACHE_MS = Number(process.env.CACHE_MS || 3000);
+const SCAN_TOP = Math.min(Number(process.env.SCAN_TOP || 60), 100);
+const SCAN_CONCURRENCY = Math.min(
+  Number(process.env.SCAN_CONCURRENCY || 6),
+  10
+);
 
 const cache = new Map();
-const priceHistory = new Map();
-const MAX_HISTORY = 1800; // 30 minutes at 1 sample/sec
-let scanCache = null;
-let lastScanAt = 0;
 
 const now = () => Date.now();
-const n = (v, fallback = null) => {
+
+function n(v, fallback = null) {
   const x = Number(v);
   return Number.isFinite(x) ? x : fallback;
-};
-const round = (x, d = 6) => Number.isFinite(x) ? Number(x.toFixed(d)) : null;
-const pct = (a, b) => (a && b) ? ((a - b) / b) * 100 : null;
+}
 
-async function fetchJSON(path, params = {}) {
-  const url = new URL(BASE + PREFIX + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+function round(v, digits = 8) {
+  if (!Number.isFinite(v)) return null;
+  return Number(v.toFixed(digits));
+}
+
+function pct(a, b) {
+  if (!a || !b) return null;
+  return ((a - b) / b) * 100;
+}
+
+/* =========================
+   BINANCE FETCH WITH FALLBACK
+========================= */
+
+async function fetchBinance(path, params = {}) {
+  let lastError = null;
+
+  for (const base of BINANCE_BASES) {
+    try {
+      const url = new URL(base + PREFIX + path);
+
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) {
+          url.searchParams.set(key, String(value));
+        }
+      }
+
+      const controller = new AbortController();
+
+      const timeout = setTimeout(() => {
+        controller.abort();
+      }, 8000);
+
+      const response = await fetch(url, {
+        headers: {
+          accept: "application/json",
+          "user-agent": "Binance-Market-Radar/1.0"
+        },
+        signal: controller.signal
+      });
+
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const text = await response.text();
+
+        lastError = new Error(
+          `Binance endpoint failed: ${base} HTTP ${response.status}: ${text}`
+        );
+
+        console.log(
+          "Binance endpoint failed:",
+          base,
+          response.status
+        );
+
+        continue;
+      }
+
+      const data = await response.json();
+
+      return {
+        data,
+        source: base,
+        fetched_at: new Date().toISOString()
+      };
+
+    } catch (error) {
+      lastError = error;
+
+      console.log(
+        "Binance endpoint error:",
+        base,
+        error.message
+      );
+    }
   }
-  const r = await fetch(url, { headers: { "accept": "application/json" } });
-  if (!r.ok) throw new Error(`Binance HTTP ${r.status}: ${await r.text()}`);
-  return r.json();
+
+  throw new Error(
+    `Unable to access Binance public market API. ${
+      lastError ? lastError.message : ""
+    }`
+  );
 }
 
 async function cached(key, ttl, fn) {
   const hit = cache.get(key);
-  if (hit && now() - hit.at < ttl) return hit.value;
+
+  if (hit && now() - hit.at < ttl) {
+    return hit.value;
+  }
+
   const value = await fn();
-  cache.set(key, { at: now(), value });
+
+  cache.set(key, {
+    at: now(),
+    value
+  });
+
   return value;
 }
 
+/* =========================
+   INDICATORS
+========================= */
+
 function ema(values, period) {
   if (values.length < period) return null;
+
   const k = 2 / (period + 1);
-  let e = values.slice(0, period).reduce((a,b)=>a+b,0) / period;
-  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1-k);
-  return e;
+
+  let result =
+    values
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period; i < values.length; i++) {
+    result =
+      values[i] * k +
+      result * (1 - k);
+  }
+
+  return result;
 }
 
 function rsi(values, period = 14) {
   if (values.length <= period) return null;
-  let gains = 0, losses = 0;
+
+  let gains = 0;
+  let losses = 0;
+
   for (let i = 1; i <= period; i++) {
-    const d = values[i] - values[i-1];
-    if (d >= 0) gains += d; else losses -= d;
+    const diff = values[i] - values[i - 1];
+
+    if (diff >= 0) {
+      gains += diff;
+    } else {
+      losses -= diff;
+    }
   }
-  let avgGain = gains / period, avgLoss = losses / period;
+
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
   for (let i = period + 1; i < values.length; i++) {
-    const d = values[i] - values[i-1];
-    avgGain = ((avgGain * (period - 1)) + Math.max(d, 0)) / period;
-    avgLoss = ((avgLoss * (period - 1)) + Math.max(-d, 0)) / period;
+    const diff = values[i] - values[i - 1];
+
+    avgGain =
+      (
+        avgGain * (period - 1) +
+        Math.max(diff, 0)
+      ) / period;
+
+    avgLoss =
+      (
+        avgLoss * (period - 1) +
+        Math.max(-diff, 0)
+      ) / period;
   }
+
   if (avgLoss === 0) return 100;
+
   const rs = avgGain / avgLoss;
+
   return 100 - 100 / (1 + rs);
 }
 
 function atr(candles, period = 14) {
   if (candles.length <= period) return null;
-  const tr = [];
-  for (let i=1;i<candles.length;i++) {
-    const c = candles[i], p = candles[i-1];
-    tr.push(Math.max(c.high-c.low, Math.abs(c.high-p.close), Math.abs(c.low-p.close)));
+
+  const ranges = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+
+    const trueRange = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    );
+
+    ranges.push(trueRange);
   }
-  let a = tr.slice(0, period).reduce((x,y)=>x+y,0)/period;
-  for (let i=period;i<tr.length;i++) a=((a*(period-1))+tr[i])/period;
-  return a;
+
+  let result =
+    ranges
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period; i < ranges.length; i++) {
+    result =
+      (
+        result * (period - 1) +
+        ranges[i]
+      ) / period;
+  }
+
+  return result;
 }
 
-function bollinger(values, period = 20, mult = 2) {
-  if (values.length < period) return null;
-  const x = values.slice(-period);
-  const mean = x.reduce((a,b)=>a+b,0)/period;
-  const variance = x.reduce((a,b)=>a+(b-mean)**2,0)/period;
-  const sd = Math.sqrt(variance);
-  return { middle: mean, upper: mean+mult*sd, lower: mean-mult*sd };
+/* =========================
+   MARKET DATA
+========================= */
+
+async function getTicker(symbol) {
+  return cached(
+    `ticker:${symbol}`,
+    2000,
+    async () => {
+      return fetchBinance(
+        "/ticker/24hr",
+        { symbol }
+      );
+    }
+  );
 }
 
-function vwap(candles, period = 50) {
-  const x = candles.slice(-period);
-  let pv = 0, vol = 0;
-  for (const c of x) {
-    const typical = (c.high+c.low+c.close)/3;
-    pv += typical*c.volume;
-    vol += c.volume;
-  }
-  return vol ? pv/vol : null;
+async function getBook(symbol) {
+  return cached(
+    `book:${symbol}`,
+    2000,
+    async () => {
+      return fetchBinance(
+        "/ticker/bookTicker",
+        { symbol }
+      );
+    }
+  );
 }
+
+async function getAllTickers() {
+  return cached(
+    "all-tickers",
+    5000,
+    async () => {
+      return fetchBinance(
+        "/ticker/24hr"
+      );
+    }
+  );
+}
+
+async function getKlines(
+  symbol,
+  interval,
+  limit = 120
+) {
+  const result = await cached(
+    `klines:${symbol}:${interval}:${limit}`,
+    CACHE_MS,
+    async () => {
+      return fetchBinance(
+        "/klines",
+        {
+          symbol,
+          interval,
+          limit
+        }
+      );
+    }
+  );
+
+  return {
+    source: result.source,
+    fetched_at: result.fetched_at,
+
+    candles: result.data.map(x => ({
+      open_time: x[0],
+      open: n(x[1]),
+      high: n(x[2]),
+      low: n(x[3]),
+      close: n(x[4]),
+      volume: n(x[5]),
+      close_time: x[6],
+      quote_volume: n(x[7]),
+      trades: n(x[8])
+    }))
+  };
+}
+
+/* =========================
+   CANDLE ANALYSIS
+========================= */
 
 function candleStats(candles) {
-  const closes = candles.map(x=>x.close);
-  const volumes = candles.map(x=>x.volume);
-  const last = candles.at(-1);
-  const prev = candles.at(-2);
-  const e9 = ema(closes,9), e21 = ema(closes,21), e50 = ema(closes,50);
-  const rr = rsi(closes,14);
-  const aa = atr(candles,14);
-  const bb = bollinger(closes,20,2);
-  const vw = vwap(candles,50);
-  const avgVol = volumes.slice(-21,-1).reduce((a,b)=>a+b,0)/Math.max(1,Math.min(20,volumes.length-1));
-  const volumeRatio = avgVol ? last.volume/avgVol : null;
-  const change = prev ? pct(last.close, prev.close) : null;
-  const lookback = candles.slice(-20);
-  const support = Math.min(...lookback.map(x=>x.low));
-  const resistance = Math.max(...lookback.map(x=>x.high));
-  const trend =
-    e9 && e21 && e50
-      ? (last.close > e9 && e9 > e21 && e21 > e50 ? "strong_up"
-        : last.close < e9 && e9 < e21 && e21 < e50 ? "strong_down"
-        : last.close > e21 ? "up"
-        : last.close < e21 ? "down" : "mixed")
-      : "unknown";
+  const closes =
+    candles.map(x => x.close);
+
+  const volumes =
+    candles.map(x => x.volume);
+
+  const last =
+    candles.at(-1);
+
+  const previous =
+    candles.at(-2);
+
+  const ema9 =
+    ema(closes, 9);
+
+  const ema21 =
+    ema(closes, 21);
+
+  const ema50 =
+    ema(closes, 50);
+
+  const rsi14 =
+    rsi(closes, 14);
+
+  const atr14 =
+    atr(candles, 14);
+
+  const recent =
+    candles.slice(-20);
+
+  const support =
+    Math.min(
+      ...recent.map(x => x.low)
+    );
+
+  const resistance =
+    Math.max(
+      ...recent.map(x => x.high)
+    );
+
+  const recentVolumes =
+    volumes.slice(-21, -1);
+
+  const averageVolume =
+    recentVolumes.length
+      ? recentVolumes.reduce(
+          (a, b) => a + b,
+          0
+        ) / recentVolumes.length
+      : null;
+
+  const volumeRatio =
+    averageVolume
+      ? last.volume / averageVolume
+      : null;
+
+  let trend = "mixed";
+
+  if (
+    ema9 &&
+    ema21 &&
+    ema50
+  ) {
+    if (
+      last.close > ema9 &&
+      ema9 > ema21 &&
+      ema21 > ema50
+    ) {
+      trend = "strong_up";
+    }
+    else if (
+      last.close < ema9 &&
+      ema9 < ema21 &&
+      ema21 < ema50
+    ) {
+      trend = "strong_down";
+    }
+    else if (
+      last.close > ema21
+    ) {
+      trend = "up";
+    }
+    else if (
+      last.close < ema21
+    ) {
+      trend = "down";
+    }
+  }
+
   return {
-    last_close: round(last.close),
-    last_change_percent: round(change,4),
-    ema9: round(e9), ema21: round(e21), ema50: round(e50),
-    rsi14: round(rr,2),
-    atr14: round(aa),
-    atr_percent: aa ? round(aa/last.close*100,3) : null,
-    vwap50: round(vw),
-    bollinger: bb && { upper: round(bb.upper), middle: round(bb.middle), lower: round(bb.lower) },
-    volume_ratio_to_20bar_average: round(volumeRatio,2),
-    support_20bar: round(support),
-    resistance_20bar: round(resistance),
+    last_close:
+      round(last.close),
+
+    last_change_percent:
+      previous
+        ? round(
+            pct(
+              last.close,
+              previous.close
+            ),
+            4
+          )
+        : null,
+
+    ema9:
+      round(ema9),
+
+    ema21:
+      round(ema21),
+
+    ema50:
+      round(ema50),
+
+    rsi14:
+      round(rsi14, 2),
+
+    atr14:
+      round(atr14),
+
+    atr_percent:
+      atr14
+        ? round(
+            atr14 /
+              last.close *
+              100,
+            4
+          )
+        : null,
+
+    volume_ratio_to_20bar_average:
+      round(volumeRatio, 2),
+
+    support_20bar:
+      round(support),
+
+    resistance_20bar:
+      round(resistance),
+
     trend
   };
 }
 
-async function getKlines(symbol, interval, limit = 120) {
-  const raw = await cached(`k:${symbol}:${interval}:${limit}`, CACHE_MS, async () => {
-    return fetchJSON("/klines", { symbol, interval, limit });
-  });
-  return raw.map(x => ({
-    open_time: x[0], open: n(x[1]), high: n(x[2]), low: n(x[3]), close: n(x[4]),
-    volume: n(x[5]), close_time: x[6], quote_volume: n(x[7]),
-    trades: n(x[8])
-  }));
-}
-
-async function getTicker(symbol) {
-  return cached(`t:${symbol}`, 1000, async () => {
-    if (MARKET === "spot") return fetchJSON("/ticker/24hr", { symbol });
-    return fetchJSON("/ticker/24hr", { symbol });
-  });
-}
-
-async function getBook(symbol) {
-  return cached(`b:${symbol}`, 1000, async () => fetchJSON("/ticker/bookTicker", { symbol }));
-}
-
-function recordPrice(symbol, price) {
-  const arr = priceHistory.get(symbol) || [];
-  arr.push({ t: now(), p: price });
-  while (arr.length > MAX_HISTORY) arr.shift();
-  priceHistory.set(symbol, arr);
-}
-
-function historyChange(symbol, seconds) {
-  const arr = priceHistory.get(symbol) || [];
-  if (arr.length < 2) return null;
-  const target = now() - seconds*1000;
-  let chosen = arr[0];
-  for (const x of arr) { if (x.t <= target) chosen = x; else break; }
-  const latest = arr.at(-1);
-  return chosen?.p ? round((latest.p-chosen.p)/chosen.p*100, 4) : null;
-}
+/* =========================
+   SYMBOL SNAPSHOT
+========================= */
 
 async function marketSnapshot(symbol) {
-  symbol = String(symbol || "").toUpperCase().replace(/[^A-Z0-9]/g,"");
-  if (!/^[A-Z0-9]{5,20}$/.test(symbol)) throw new Error("Invalid symbol");
 
-  const intervals = ["1m","3m","5m","15m","1h","4h"];
-  const [ticker, book, ...allK] = await Promise.all([
-    getTicker(symbol), getBook(symbol),
-    ...intervals.map(i=>getKlines(symbol,i,120))
-  ]);
-  const price = n(ticker.lastPrice);
-  recordPrice(symbol, price);
+  symbol =
+    String(symbol || "BTCUSDT")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "");
 
-  const byInterval = {};
-  intervals.forEach((i,idx)=>{
-    const candles = allK[idx];
-    byInterval[i] = {
-      stats: candleStats(candles),
-      candles: candles.slice(-60)
-    };
-  });
+  if (
+    !/^[A-Z0-9]{5,20}$/.test(symbol)
+  ) {
+    throw new Error(
+      "Invalid symbol"
+    );
+  }
 
-  const bid = n(book.bidPrice), ask = n(book.askPrice);
-  const spread = bid && ask ? (ask-bid)/((ask+bid)/2)*100 : null;
+  const intervals = [
+    "1m",
+    "5m",
+    "15m",
+    "1h"
+  ];
+
+  const results =
+    await Promise.all([
+      getTicker(symbol),
+      getBook(symbol),
+
+      ...intervals.map(
+        interval =>
+          getKlines(
+            symbol,
+            interval,
+            120
+          )
+      )
+    ]);
+
+  const tickerResult =
+    results[0];
+
+  const bookResult =
+    results[1];
+
+  const ticker =
+    tickerResult.data;
+
+  const book =
+    bookResult.data;
+
+  const intervalResults =
+    results.slice(2);
+
+  const price =
+    n(ticker.lastPrice);
+
+  const bid =
+    n(book.bidPrice);
+
+  const ask =
+    n(book.askPrice);
+
+  const spread =
+    bid && ask
+      ? (
+          (ask - bid) /
+          ((ask + bid) / 2)
+        ) * 100
+      : null;
+
+  const intervalsData = {};
+
+  intervals.forEach(
+    (interval, index) => {
+
+      const klineResult =
+        intervalResults[index];
+
+      intervalsData[interval] = {
+
+        source:
+          klineResult.source,
+
+        fetched_at:
+          klineResult.fetched_at,
+
+        stats:
+          candleStats(
+            klineResult.candles
+          )
+      };
+    }
+  );
+
+  const trendScore =
+    ["1m", "5m", "15m", "1h"]
+      .map(
+        interval =>
+          intervalsData[
+            interval
+          ].stats.trend
+      )
+      .reduce(
+        (score, trend) => {
+
+          if (
+            trend === "strong_up"
+          ) return score + 2;
+
+          if (
+            trend === "up"
+          ) return score + 1;
+
+          if (
+            trend === "strong_down"
+          ) return score - 2;
+
+          if (
+            trend === "down"
+          ) return score - 1;
+
+          return score;
+
+        },
+        0
+      );
+
   return {
+
     meta: {
-      symbol, market: MARKET, source: "Binance public market API",
-      generated_at: new Date().toISOString(),
-      generated_at_unix_ms: now(),
-      cache_note: `Some REST components may be cached for up to ${CACHE_MS} ms to protect rate limits.`
+
+      symbol,
+
+      market:
+        "Binance Spot",
+
+      generated_at:
+        new Date().toISOString(),
+
+      source:
+        tickerResult.source,
+
+      data_note:
+        "Market data was fetched during this request. Short caches may be used to reduce API rate-limit pressure."
+
     },
+
     live: {
-      last_price: round(price),
-      bid: round(bid), ask: round(ask),
-      spread_percent: round(spread,5),
-      price_change_percent_24h: round(n(ticker.priceChangePercent),4),
-      high_24h: round(n(ticker.highPrice)),
-      low_24h: round(n(ticker.lowPrice)),
-      base_volume_24h: round(n(ticker.volume)),
-      quote_volume_24h: round(n(ticker.quoteVolume)),
-      trade_count_24h: n(ticker.count),
-      server_sample_change_5s: historyChange(symbol,5),
-      server_sample_change_30s: historyChange(symbol,30),
-      server_sample_change_60s: historyChange(symbol,60),
-      server_sample_change_300s: historyChange(symbol,300)
+
+      last_price:
+        round(price),
+
+      bid:
+        round(bid),
+
+      ask:
+        round(ask),
+
+      spread_percent:
+        round(
+          spread,
+          5
+        ),
+
+      price_change_percent_24h:
+        round(
+          n(
+            ticker.priceChangePercent
+          ),
+          4
+        ),
+
+      high_24h:
+        round(
+          n(
+            ticker.highPrice
+          )
+        ),
+
+      low_24h:
+        round(
+          n(
+            ticker.lowPrice
+          )
+        ),
+
+      base_volume_24h:
+        round(
+          n(
+            ticker.volume
+          )
+        ),
+
+      quote_volume_24h:
+        round(
+          n(
+            ticker.quoteVolume
+          )
+        ),
+
+      trade_count_24h:
+        n(
+          ticker.count
+        )
     },
-    intervals: byInterval,
-    interpretation: buildInterpretation(byInterval, price)
+
+    intervals:
+      intervalsData,
+
+    interpretation: {
+
+      multi_timeframe_score:
+        trendScore,
+
+      state:
+
+        trendScore >= 6
+          ? "strong_bullish"
+
+          : trendScore >= 2
+          ? "bullish"
+
+          : trendScore <= -6
+          ? "strong_bearish"
+
+          : trendScore <= -2
+          ? "bearish"
+
+          : "mixed",
+
+      support_15m:
+        intervalsData[
+          "15m"
+        ].stats
+          .support_20bar,
+
+      resistance_15m:
+        intervalsData[
+          "15m"
+        ].stats
+          .resistance_20bar,
+
+      warning:
+        "This is descriptive market analysis, not guaranteed trading advice."
+    }
   };
 }
 
-function buildInterpretation(x, price) {
-  const t = ["1m","5m","15m","1h","4h"].map(i=>x[i].stats);
-  const score = t.reduce((s,a)=>s + (
-    a.trend==="strong_up"?2:a.trend==="up"?1:a.trend==="strong_down"?-2:a.trend==="down"?-1:0
-  ),0);
-  const volatility = x["15m"].stats.atr_percent;
-  const volume = x["15m"].stats.volume_ratio_to_20bar_average;
-  const r = x["15m"].stats.rsi14;
-  return {
-    multi_timeframe_trend_score: score,
-    multi_timeframe_state: score >= 6 ? "strong_bullish" : score >= 2 ? "bullish" : score <= -6 ? "strong_bearish" : score <= -2 ? "bearish" : "mixed",
-    volatility_15m: volatility == null ? "unknown" : volatility > 2 ? "high" : volatility > 0.7 ? "medium" : "low",
-    volume_state_15m: volume == null ? "unknown" : volume >= 2 ? "unusually_high" : volume >= 1.3 ? "above_average" : volume < 0.7 ? "below_average" : "normal",
-    rsi_state_15m: r == null ? "unknown" : r >= 75 ? "overbought_zone" : r <= 25 ? "oversold_zone" : "neutral_zone",
-    nearest_support_15m: x["15m"].stats.support_20bar,
-    nearest_resistance_15m: x["15m"].stats.resistance_20bar,
-    current_price: round(price),
-    warning: "Machine-generated labels are descriptive, not trade instructions. Check timestamp and liquidity before acting."
-  };
+/* =========================
+   MARKET SCAN
+========================= */
+
+function isExcludedSymbol(symbol) {
+
+  const excluded = [
+    "USDCUSDT",
+    "FDUSDUSDT",
+    "TUSDUSDT",
+    "USDPUSDT",
+    "DAIUSDT",
+    "BUSDUSDT"
+  ];
+
+  if (
+    excluded.includes(symbol)
+  ) return true;
+
+  if (
+    symbol.includes("UPUSDT") ||
+    symbol.includes("DOWNUSDT")
+  ) return true;
+
+  return false;
 }
 
-async function allTickers() {
-  const key = MARKET === "spot" ? "/ticker/24hr" : "/ticker/24hr";
-  return cached("all:tickers", 5000, async()=>fetchJSON(key));
-}
+function candidateScore(ticker) {
 
-function candidateScore(t) {
-  const qv = Math.log10(Math.max(1,n(t.quoteVolume,0)));
-  const move = Math.abs(n(t.priceChangePercent,0));
-  const trades = Math.log10(Math.max(1,n(t.count,0)));
-  return move*2 + qv*3 + trades;
+  const quoteVolume =
+    Math.log10(
+      Math.max(
+        1,
+        n(
+          ticker.quoteVolume,
+          0
+        )
+      )
+    );
+
+  const movement =
+    Math.abs(
+      n(
+        ticker.priceChangePercent,
+        0
+      )
+    );
+
+  const trades =
+    Math.log10(
+      Math.max(
+        1,
+        n(
+          ticker.count,
+          0
+        )
+      )
+    );
+
+  return (
+    movement * 2 +
+    quoteVolume * 3 +
+    trades
+  );
 }
 
 async function scanMarket() {
-  if (scanCache && now()-lastScanAt < 15000) return scanCache;
-  const tickers = await allTickers();
-  const candidates = tickers
-    .filter(t => String(t.symbol).endsWith("USDT"))
-    .filter(t => n(t.lastPrice) > 0 && n(t.quoteVolume) > 0)
-    .sort((a,b)=>candidateScore(b)-candidateScore(a))
-    .slice(0, SCAN_TOP);
 
-  const out = [];
-  for (let i=0;i<candidates.length;i+=SCAN_CONCURRENCY) {
-    const batch = candidates.slice(i,i+SCAN_CONCURRENCY);
-    const r = await Promise.all(batch.map(async t=>{
-      try {
-        const candles = await getKlines(t.symbol,"15m",80);
-        const s = candleStats(candles);
-        const move = Math.abs(n(t.priceChangePercent,0));
-        const anomaly = move + Math.max(0,(s.volume_ratio_to_20bar_average||1)-1)*5 +
-          (s.atr_percent||0)*2 +
-          (s.trend==="strong_up"||s.trend==="strong_down"?4:0);
-        return {
-          symbol:t.symbol,
-          last_price:round(n(t.lastPrice)),
-          change_24h_percent:round(n(t.priceChangePercent),3),
-          quote_volume_24h:round(n(t.quoteVolume),2),
-          trend_15m:s.trend,
-          rsi14_15m:s.rsi14,
-          atr_percent_15m:s.atr_percent,
-          volume_ratio_15m:s.volume_ratio_to_20bar_average,
-          anomaly_score:round(anomaly,3)
-        };
-      } catch (e) { return null; }
-    }));
-    out.push(...r.filter(Boolean));
+  const tickerResult =
+    await getAllTickers();
+
+  const tickers =
+    tickerResult.data;
+
+  const candidates =
+    tickers
+
+      .filter(
+        t =>
+          String(
+            t.symbol
+          ).endsWith(
+            "USDT"
+          )
+      )
+
+      .filter(
+        t =>
+          !isExcludedSymbol(
+            t.symbol
+          )
+      )
+
+      .filter(
+        t =>
+          n(
+            t.lastPrice
+          ) > 0 &&
+          n(
+            t.quoteVolume
+          ) > 100000
+      )
+
+      .sort(
+        (a, b) =>
+          candidateScore(b) -
+          candidateScore(a)
+      )
+
+      .slice(
+        0,
+        SCAN_TOP
+      );
+
+  const output = [];
+
+  for (
+    let i = 0;
+    i < candidates.length;
+    i += SCAN_CONCURRENCY
+  ) {
+
+    const batch =
+      candidates.slice(
+        i,
+        i +
+          SCAN_CONCURRENCY
+      );
+
+    const batchResults =
+      await Promise.all(
+
+        batch.map(
+          async ticker => {
+
+            try {
+
+              const kline =
+                await getKlines(
+                  ticker.symbol,
+                  "15m",
+                  80
+                );
+
+              const stats =
+                candleStats(
+                  kline.candles
+                );
+
+              const movement =
+                Math.abs(
+                  n(
+                    ticker
+                      .priceChangePercent,
+                    0
+                  )
+                );
+
+              const volumeBonus =
+                Math.max(
+                  0,
+                  (
+                    stats
+                      .volume_ratio_to_20bar_average ||
+                    1
+                  ) - 1
+                ) * 5;
+
+              const trendBonus =
+                (
+                  stats.trend ===
+                    "strong_up" ||
+                  stats.trend ===
+                    "strong_down"
+                )
+                  ? 4
+                  : 0;
+
+              const anomalyScore =
+                movement +
+                volumeBonus +
+                (
+                  stats
+                    .atr_percent ||
+                  0
+                ) * 2 +
+                trendBonus;
+
+              return {
+
+                symbol:
+                  ticker.symbol,
+
+                last_price:
+                  round(
+                    n(
+                      ticker
+                        .lastPrice
+                    )
+                  ),
+
+                change_24h_percent:
+                  round(
+                    n(
+                      ticker
+                        .priceChangePercent
+                    ),
+                    3
+                  ),
+
+                quote_volume_24h:
+                  round(
+                    n(
+                      ticker
+                        .quoteVolume
+                    ),
+                    2
+                  ),
+
+                trend_15m:
+                  stats.trend,
+
+                rsi14_15m:
+                  stats.rsi14,
+
+                atr_percent_15m:
+                  stats
+                    .atr_percent,
+
+                volume_ratio_15m:
+                  stats
+                    .volume_ratio_to_20bar_average,
+
+                anomaly_score:
+                  round(
+                    anomalyScore,
+                    3
+                  )
+
+              };
+
+            } catch (
+              error
+            ) {
+
+              console.log(
+                "Scan error:",
+                ticker.symbol,
+                error.message
+              );
+
+              return null;
+            }
+          }
+        )
+      );
+
+    output.push(
+      ...batchResults.filter(
+        Boolean
+      )
+    );
   }
 
-  out.sort((a,b)=>b.anomaly_score-a.anomaly_score);
-  scanCache = {
-    meta:{
-      generated_at:new Date().toISOString(),
-      market:MARKET,
-      scanned_candidates:out.length,
-      methodology:"Ranks liquid USDT markets by 24h movement, 15m volatility, unusual volume and strong EMA alignment. This is a screening score, not a prediction."
+  output.sort(
+    (a, b) =>
+      b.anomaly_score -
+      a.anomaly_score
+  );
+
+  return {
+
+    meta: {
+
+      generated_at:
+        new Date().toISOString(),
+
+      market:
+        "Binance Spot USDT",
+
+      source:
+        tickerResult.source,
+
+      scanned_candidates:
+        output.length,
+
+      methodology:
+        "Screening based on liquidity, 24h movement, 15m volatility, unusual volume and EMA trend alignment. Ranking is not a prediction."
+
     },
-    hottest:out.slice(0,30),
-    strongest_uptrend:out.filter(x=>x.trend_15m==="strong_up"||x.trend_15m==="up").slice(0,20),
-    strongest_downtrend:out.filter(x=>x.trend_15m==="strong_down"||x.trend_15m==="down").slice(0,20)
+
+    hottest:
+      output.slice(
+        0,
+        30
+      ),
+
+    strongest_uptrend:
+      output
+        .filter(
+          x =>
+            x.trend_15m ===
+              "strong_up" ||
+            x.trend_15m ===
+              "up"
+        )
+        .slice(
+          0,
+          20
+        ),
+
+    strongest_downtrend:
+      output
+        .filter(
+          x =>
+            x.trend_15m ===
+              "strong_down" ||
+            x.trend_15m ===
+              "down"
+        )
+        .slice(
+          0,
+          20
+        )
   };
-  lastScanAt=now();
-  return scanCache;
 }
 
-function textReport(m) {
-  const lines=[];
-  lines.push(`MARKET SNAPSHOT: ${m.meta.symbol}`);
-  lines.push(`Generated: ${m.meta.generated_at} (${m.meta.generated_at_unix_ms})`);
-  lines.push(`Current price: ${m.live.last_price}`);
-  lines.push(`Bid/Ask: ${m.live.bid} / ${m.live.ask}; spread=${m.live.spread_percent}%`);
-  lines.push(`24h change: ${m.live.price_change_percent_24h}% | 24h high/low: ${m.live.high_24h} / ${m.live.low_24h}`);
-  lines.push(`24h quote volume: ${m.live.quote_volume_24h}`);
-  lines.push(`Server sampled change 5s/30s/60s/300s: ${m.live.server_sample_change_5s}% / ${m.live.server_sample_change_30s}% / ${m.live.server_sample_change_60s}% / ${m.live.server_sample_change_300s}%`);
+/* =========================
+   TEXT REPORT
+========================= */
+
+function textReport(data) {
+
+  const lines = [];
+
+  lines.push(
+    `MARKET: ${data.meta.symbol}`
+  );
+
+  lines.push(
+    `GENERATED: ${data.meta.generated_at}`
+  );
+
+  lines.push(
+    `SOURCE: ${data.meta.source}`
+  );
+
   lines.push("");
-  for (const [tf,v] of Object.entries(m.intervals)) {
-    const s=v.stats;
-    lines.push(`[${tf}] trend=${s.trend}; last=${s.last_close}; change=${s.last_change_percent}%`);
-    lines.push(`EMA9/21/50=${s.ema9}/${s.ema21}/${s.ema50}; RSI14=${s.rsi14}; ATR%=${s.atr_percent}; VWAP50=${s.vwap50}`);
-    lines.push(`Volume ratio=${s.volume_ratio_to_20bar_average}; Support20=${s.support_20bar}; Resistance20=${s.resistance_20bar}`);
+
+  lines.push(
+    `PRICE: ${data.live.last_price}`
+  );
+
+  lines.push(
+    `24H CHANGE: ${data.live.price_change_percent_24h}%`
+  );
+
+  lines.push(
+    `24H HIGH: ${data.live.high_24h}`
+  );
+
+  lines.push(
+    `24H LOW: ${data.live.low_24h}`
+  );
+
+  lines.push(
+    `24H QUOTE VOLUME: ${data.live.quote_volume_24h}`
+  );
+
+  lines.push("");
+
+  for (
+    const [
+      interval,
+      value
+    ] of Object.entries(
+      data.intervals
+    )
+  ) {
+
+    const s =
+      value.stats;
+
+    lines.push(
+      `[${interval}]`
+    );
+
+    lines.push(
+      `TREND: ${s.trend}`
+    );
+
+    lines.push(
+      `PRICE: ${s.last_close}`
+    );
+
+    lines.push(
+      `EMA 9/21/50: ${s.ema9} / ${s.ema21} / ${s.ema50}`
+    );
+
+    lines.push(
+      `RSI14: ${s.rsi14}`
+    );
+
+    lines.push(
+      `ATR%: ${s.atr_percent}`
+    );
+
+    lines.push(
+      `VOLUME RATIO: ${s.volume_ratio_to_20bar_average}`
+    );
+
+    lines.push(
+      `SUPPORT: ${s.support_20bar}`
+    );
+
+    lines.push(
+      `RESISTANCE: ${s.resistance_20bar}`
+    );
+
+    lines.push("");
   }
-  lines.push("");
-  lines.push(`MULTI-TIMEFRAME STATE: ${m.interpretation.multi_timeframe_state}; score=${m.interpretation.multi_timeframe_trend_score}`);
-  lines.push(`15m volatility=${m.interpretation.volatility_15m}; volume=${m.interpretation.volume_state_15m}; RSI=${m.interpretation.rsi_state_15m}`);
-  lines.push(`IMPORTANT: This is a timestamped market snapshot, not financial advice or a guaranteed prediction.`);
-  return lines.join("\n");
+
+  lines.push(
+    `MULTI TIMEFRAME: ${data.interpretation.state}`
+  );
+
+  lines.push(
+    `SCORE: ${data.interpretation.multi_timeframe_score}`
+  );
+
+  lines.push(
+    `IMPORTANT: This is market screening, not guaranteed profit.`
+  );
+
+  return lines.join(
+    "\n"
+  );
 }
 
-app.get("/", (req,res)=>res.type("html").send(`
-<!doctype html><html><head><meta charset="utf-8"><title>Binance AI Market Bridge</title>
-<style>body{font-family:system-ui;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.55}input,button{padding:10px;font-size:16px}pre{white-space:pre-wrap;background:#f5f5f5;padding:16px;border-radius:8px}</style></head>
-<body><h1>Binance AI Market Bridge</h1>
-<p>AI data transport layer. No API key required.</p>
-<input id="s" value="BTCUSDT"><button onclick="go()">Open report</button>
-<p><a href="/api/brief">/api/brief</a> — AI market overview</p>
-<p><a href="/api/scan">/api/scan</a> — automatic market scan</p>
-<pre id="out">Enter a symbol, e.g. BTCUSDT.</pre>
+/* =========================
+   WEB PAGE
+========================= */
+
+app.get(
+  "/",
+  (
+    req,
+    res
+  ) => {
+
+    res
+      .type(
+        "html"
+      )
+      .send(
+`
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<meta
+name="viewport"
+content="width=device-width,initial-scale=1"
+>
+
+<title>
+Binance AI Market Bridge
+</title>
+
+<style>
+
+body{
+font-family:system-ui;
+max-width:900px;
+margin:40px auto;
+padding:0 16px;
+line-height:1.55
+}
+
+input,
+button{
+padding:10px;
+font-size:16px;
+margin:4px
+}
+
+pre{
+white-space:pre-wrap;
+background:#f5f5f5;
+padding:16px;
+border-radius:8px;
+overflow:auto
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>
+Binance AI Market Bridge
+</h1>
+
+<p>
+Binance public market data scanner.
+</p>
+
+<input
+id="s"
+value="BTCUSDT"
+>
+
+<button
+onclick="go()"
+>
+Open report
+</button>
+
+<p>
+<a href="/api/brief">
+/api/brief
+</a>
+
+—
+market overview
+</p>
+
+<p>
+<a href="/api/scan">
+/api/scan
+</a>
+
+—
+scan active USDT markets
+</p>
+
+<pre
+id="out"
+>
+Enter a symbol, e.g. BTCUSDT.
+</pre>
+
 <script>
-async function go(){let s=document.getElementById('s').value.toUpperCase();let r=await fetch('/api/report?symbol='+encodeURIComponent(s));document.getElementById('out').textContent=await r.text();}
-</script></body></html>
-`));
 
-app.get("/health", (req,res)=>res.json({ok:true, now:new Date().toISOString(), market:MARKET, base:BASE}));
+async function go(){
 
-app.get("/api/market", async (req,res)=>{
-  try { res.json(await marketSnapshot(req.query.symbol || "BTCUSDT")); }
-  catch(e){ res.status(400).json({error:String(e.message)}); }
-});
+const symbol =
+document
+.getElementById(
+"s"
+)
+.value
+.toUpperCase();
 
-app.get("/api/report", async (req,res)=>{
-  try {
-    const m=await marketSnapshot(req.query.symbol || "BTCUSDT");
-    res.type("text/plain; charset=utf-8").send(textReport(m));
-  } catch(e){ res.status(400).type("text/plain").send("ERROR: "+e.message); }
-});
+const response =
+await fetch(
+"/api/report?symbol=" +
+encodeURIComponent(
+symbol
+)
+);
 
-app.get("/api/scan", async (req,res)=>{
-  try { res.json(await scanMarket()); }
-  catch(e){ res.status(502).json({error:String(e.message)}); }
-});
+document
+.getElementById(
+"out"
+)
+.textContent =
+await response.text();
 
-app.get("/api/brief", async (req,res)=>{
-  try {
-    const scan=await scanMarket();
-    const symbols=scan.hottest.slice(0,10).map(x=>x.symbol);
-    const snapshots=await Promise.all(symbols.map(async symbol=>{
-      try {
-        const m=await marketSnapshot(symbol);
-        return {
-          symbol,
-          generated_at:m.meta.generated_at,
-          current_price:m.live.last_price,
-          change_24h_percent:m.live.price_change_percent_24h,
-          multi_timeframe_state:m.interpretation.multi_timeframe_state,
-          trend_score:m.interpretation.multi_timeframe_trend_score,
-          volatility_15m:m.interpretation.volatility_15m,
-          volume_state_15m:m.interpretation.volume_state_15m,
-          rsi_state_15m:m.interpretation.rsi_state_15m,
-          support_15m:m.interpretation.nearest_support_15m,
-          resistance_15m:m.interpretation.nearest_resistance_15m
-        };
-      } catch(e){return {symbol,error:e.message};}
-    }));
+}
+
+</script>
+
+</body>
+
+</html>
+`
+      );
+  }
+);
+
+/* =========================
+   API ENDPOINTS
+========================= */
+
+app.get(
+  "/health",
+  (
+    req,
+    res
+  ) => {
+
     res.json({
-      meta:{
-        generated_at:new Date().toISOString(),
-        purpose:"AI-readable current market overview. Verify generated_at before using. Individual detail is available at /api/report?symbol=SYMBOL."
-      },
-      scan,
-      top_market_snapshots:snapshots
-    });
-  } catch(e){res.status(502).json({error:String(e.message)});}
-});
 
-app.listen(PORT, ()=>console.log(`Binance AI Market Bridge listening on ${PORT}; market=${MARKET}; base=${BASE}`));
+      ok:
+        true,
+
+      now:
+        new Date().toISOString(),
+
+      market:
+        "spot",
+
+      endpoints:
+        BINANCE_BASES
+
+    });
+
+  }
+);
+
+app.get(
+  "/api/market",
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const data =
+        await marketSnapshot(
+          req.query.symbol ||
+          "BTCUSDT"
+        );
+
+      res.json(
+        data
+      );
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(502)
+        .json({
+
+          error:
+            error.message
+
+        });
+
+    }
+
+  }
+);
+
+app.get(
+  "/api/report",
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const data =
+        await marketSnapshot(
+          req.query.symbol ||
+          "BTCUSDT"
+        );
+
+      res
+        .type(
+          "text/plain; charset=utf-8"
+        )
+        .send(
+          textReport(
+            data
+          )
+        );
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(502)
+        .type(
+          "text/plain"
+        )
+        .send(
+          "ERROR: " +
+          error.message
+        );
+
+    }
+
+  }
+);
+
+app.get(
+  "/api/scan",
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const data =
+        await scanMarket();
+
+      res.json(
+        data
+      );
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(502)
+        .json({
+
+          error:
+            error.message
+
+        });
+
+    }
+
+  }
+);
+
+app.get(
+  "/api/brief",
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const scan =
+        await scanMarket();
+
+      const symbols =
+        scan
+          .hottest
+          .slice(
+            0,
+            10
+          )
+          .map(
+            x =>
+              x.symbol
+          );
+
+      const snapshots =
+        await Promise.all(
+
+          symbols.map(
+            async symbol => {
+
+              try {
+
+                const data =
+                  await marketSnapshot(
+                    symbol
+                  );
+
+                return {
+
+                  symbol,
+
+                  generated_at:
+                    data.meta.generated_at,
+
+                  source:
+                    data.meta.source,
+
+                  current_price:
+                    data.live.last_price,
+
+                  change_24h_percent:
+                    data.live
+                      .price_change_percent_24h,
+
+                  trend:
+                    data.interpretation.state,
+
+                  trend_score:
+                    data.interpretation
+                      .multi_timeframe_score,
+
+                  support_15m:
+                    data.interpretation
+                      .support_15m,
+
+                  resistance_15m:
+                    data.interpretation
+                      .resistance_15m
+
+                };
+
+              } catch (
+                error
+              ) {
+
+                return {
+
+                  symbol,
+
+                  error:
+                    error.message
+
+                };
+
+              }
+
+            }
+          )
+        );
+
+      res.json({
+
+        meta: {
+
+          generated_at:
+            new Date().toISOString(),
+
+          purpose:
+            "Current market screening data."
+
+        },
+
+        scan,
+
+        top_market_snapshots:
+          snapshots
+
+      });
+
+    } catch (
+      error
+    ) {
+
+      res
+        .status(502)
+        .json({
+
+          error:
+            error.message
+
+        });
+
+    }
+
+  }
+);
+
+/* =========================
+   START SERVER
+========================= */
+
+app.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `Binance AI Market Bridge listening on ${PORT}`
+    );
+
+  }
+);
